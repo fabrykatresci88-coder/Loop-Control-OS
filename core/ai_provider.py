@@ -32,7 +32,8 @@ class OpenAIProvider(AIProvider):
     """An AI provider implementation for OpenAI's Responses API."""
 
     API_KEY_ENV = "OPENAI_API_KEY"
-    DEFAULT_MODEL = "gpt-5.5"
+    MODEL_ENV = "OPENAI_MODEL"
+    DEFAULT_MODEL = "gpt-4.1-mini"
     DEFAULT_EMBEDDING_MODEL = "text-embedding-3"
     DEFAULT_TIMEOUT_SECONDS = 60
     DEFAULT_MAX_RETRIES = 0
@@ -47,7 +48,7 @@ class OpenAIProvider(AIProvider):
             load_dotenv()
 
         self.api_key = api_key or os.getenv(self.API_KEY_ENV)
-        self.model = model or self.DEFAULT_MODEL
+        self.model = model or os.getenv(self.MODEL_ENV, self.DEFAULT_MODEL)
         self.embedding_model = embedding_model or self.DEFAULT_EMBEDDING_MODEL
         self.client = (
             OpenAI(
@@ -87,8 +88,11 @@ class OpenAIProvider(AIProvider):
             )
             print("[DEBUG] after client.responses.create()")
         except Exception as error:
+            print("[DEBUG] full exception:", error)
+            print("[DEBUG] repr(error):", repr(error))
+            print("[DEBUG] type(error):", type(error))
             traceback.print_exc()
-            raise RuntimeError(self._format_openai_error(error)) from error
+            raise
 
         try:
             result = self._parse_model_response(response)

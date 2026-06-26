@@ -1,4 +1,3 @@
-
 ==================== SYSTEM ====================
 
 # SYSTEM PROMPT
@@ -26,4 +25,4 @@ Na końcu wygeneruj kompletny plan projektu.
 
 ==================== POMYSŁ ====================
 
-Aplikacja do zarządzania warsztatem samochodowym z AI.
+Simple AI SaaS for debugging flaky tests

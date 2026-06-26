@@ -43,14 +43,17 @@ class LoopControlGUI:
 
     def __init__(self, root):
         self.root = root
-        self.log_queue = queue.Queue()
+        self.main_thread_id = threading.get_ident()
+        self.ui_queue = queue.Queue()
         self.pipeline_states = {stage: tk.BooleanVar(value=False) for stage in PIPELINE_STAGES}
         self.provider_name = tk.StringVar(value="openai")
+        self.cache_enabled_var = tk.BooleanVar(value=True)
         self.project_service = ProjectService(
             repository=FileProjectRepository(),
             prompt_generator=TemplatePromptGenerator(),
             ai_provider=create_provider(self.provider_name.get()),
         )
+        self.project_service.set_cache_enabled(self.cache_enabled_var.get())
         self.executor_controller = ExecutorController(
             service=self.project_service,
             progress_callback=self.append_progress,
@@ -60,7 +63,7 @@ class LoopControlGUI:
 
         self.setup_window()
         self.create_widgets()
-        self.root.after(100, self.process_log_queue)
+        self.root.after(50, self.process_ui_events)
 
     def setup_window(self):
         self.root.title("Loop Control OS")
@@ -214,7 +217,7 @@ class LoopControlGUI:
         button = tk.Button(
             parent,
             text=label,
-            command=lambda: self.run_background_task(command),
+            command=command,
             bg=BUTTON_BG,
             fg=BUTTON_FG,
             activebackground=ACCENT_HOVER,
@@ -234,6 +237,37 @@ class LoopControlGUI:
         thread = threading.Thread(target=task, daemon=True)
         thread.start()
 
+    def _is_main_thread(self) -> bool:
+        return threading.get_ident() == self.main_thread_id
+
+    def _emit_ui_event(self, event_type: str, payload):
+        self.ui_queue.put((event_type, payload))
+
+    def _show_message(self, level: str, title: str, text: str) -> None:
+        if self._is_main_thread():
+            if level == "info":
+                messagebox.showinfo(title, text)
+            elif level == "warning":
+                messagebox.showwarning(title, text)
+            else:
+                messagebox.showerror(title, text)
+            return
+        self._emit_ui_event("message", (level, title, text))
+
+    @staticmethod
+    def _describe_exception(error: Exception) -> str:
+        parts = []
+        seen = set()
+        current = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            parts.append(f"{type(current).__name__}: {current}")
+            next_error = current.__cause__ or current.__context__
+            if not isinstance(next_error, Exception):
+                break
+            current = next_error
+        return " <- caused by ".join(parts)
+
     def on_text_focus_in(self, event):
         if self.idea_text.get("1.0", tk.END).strip() in ["Describe your startup idea here...", ""]:
             self.idea_text.delete("1.0", tk.END)
@@ -251,21 +285,27 @@ class LoopControlGUI:
         return text
 
     def update_pipeline(self, stage: str, value: bool):
+        if not self._is_main_thread():
+            self._emit_ui_event("pipeline", (stage, value))
+            return
         if stage in self.pipeline_states:
             self.pipeline_states[stage].set(value)
 
     def reset_pipeline(self):
-        for stage in self.pipeline_states.values():
-            stage.set(False)
+        for stage in self.pipeline_states:
+            self.update_pipeline(stage, False)
 
     def append_log(self, message: str) -> None:
-        self.log_queue.put(message)
+        self._emit_ui_event("log", message)
 
     def append_error(self, message: str) -> None:
-        self.log_queue.put(f"ERROR: {message}")
+        self._emit_ui_event("log", f"ERROR: {message}")
 
     def append_progress(self, message: str) -> None:
-        self.log_queue.put(f"PROGRESS: {message}")
+        self._emit_ui_event("log", f"PROGRESS: {message}")
+        self._emit_ui_event("progress", message)
+
+    def _apply_progress_update(self, message: str) -> None:
         current = self.progress_bar['value']
         if "Validating" in message:
             self.progress_bar['value'] = 20
@@ -276,113 +316,123 @@ class LoopControlGUI:
         else:
             self.progress_bar['value'] = min(100, current + 10)
 
-    def process_log_queue(self) -> None:
-        while not self.log_queue.empty():
-            message = self.log_queue.get_nowait()
-            self.output_text.config(state=tk.NORMAL)
-            self.output_text.insert(tk.END, message + "\n")
-            self.output_text.see(tk.END)
-            self.output_text.config(state=tk.DISABLED)
-        self.root.after(100, self.process_log_queue)
+    def _append_output_line(self, message: str) -> None:
+        self.output_text.config(state=tk.NORMAL)
+        self.output_text.insert(tk.END, message + "\n")
+        self.output_text.see(tk.END)
+        self.output_text.config(state=tk.DISABLED)
+
+    def process_ui_events(self) -> None:
+        while not self.ui_queue.empty():
+            event_type, payload = self.ui_queue.get_nowait()
+            if event_type == "log":
+                self._append_output_line(payload)
+            elif event_type == "progress":
+                self._apply_progress_update(payload)
+            elif event_type == "pipeline":
+                stage, value = payload
+                if stage in self.pipeline_states:
+                    self.pipeline_states[stage].set(value)
+            elif event_type == "message":
+                level, title, text = payload
+                if level == "info":
+                    messagebox.showinfo(title, text)
+                elif level == "warning":
+                    messagebox.showwarning(title, text)
+                else:
+                    messagebox.showerror(title, text)
+            elif event_type == "progress_set":
+                self.progress_bar['value'] = payload
+
+        self.root.after(50, self.process_ui_events)
 
     def on_analyze(self):
         self.analyze_project()
 
     def analyze_project(self):
-        print("[DEBUG] analyze_project: before get_idea_text()")
         idea = self.get_idea_text()
-        print("[DEBUG] analyze_project: after get_idea_text()")
         if not idea:
-            print("[DEBUG] analyze_project: before messagebox.showwarning()")
-            messagebox.showwarning("Empty Idea", "Please describe your startup idea.")
-            print("[DEBUG] analyze_project: after messagebox.showwarning()")
+            self._show_message("warning", "Empty Idea", "Please describe your startup idea.")
             return
 
-        print("[DEBUG] analyze_project: before selected_modules collection")
         selected_modules = [
             stage for stage, var in self.pipeline_states.items() if var.get()
         ]
-        print(f"[DEBUG] analyze_project: after selected_modules collection -> {selected_modules}")
 
-        print("[DEBUG] analyze_project: before append_log('Starting analysis...')")
         self.append_log("Starting analysis...")
-        print("[DEBUG] analyze_project: after append_log('Starting analysis...')")
-        print("[DEBUG] analyze_project: before reset_pipeline()")
         self.reset_pipeline()
-        print("[DEBUG] analyze_project: after reset_pipeline()")
-        print("[DEBUG] analyze_project: before append_log('▸ Brain check started')")
         self.append_log("▸ Brain check started")
-        print("[DEBUG] analyze_project: after append_log('▸ Brain check started')")
-        print("[DEBUG] analyze_project: before update_pipeline('Brain', True)")
         self.update_pipeline("Brain", True)
-        print("[DEBUG] analyze_project: after update_pipeline('Brain', True)")
 
+        self.run_background_task(
+            lambda: self._run_analyze_worker(idea, selected_modules)
+        )
+
+    def _run_analyze_worker(self, idea: str, selected_modules: list[str]) -> None:
         try:
-            print("[DEBUG] analyze_project: before project_service.create_project()")
             state = self.project_service.create_project(idea)
-            print("[DEBUG] analyze_project: after project_service.create_project()")
-            print("[DEBUG] analyze_project: before append_log('▸ Project description saved')")
             self.append_log("▸ Project description saved")
-            print("[DEBUG] analyze_project: after append_log('▸ Project description saved')")
-            print("[DEBUG] analyze_project: before update_pipeline('Business', True)")
             self.update_pipeline("Business", True)
-            print("[DEBUG] analyze_project: after update_pipeline('Business', True)")
 
-            print("[DEBUG] analyze_project: before project_service.analyze()")
             report = self.project_service.analyze(
                 state,
                 selected_modules=selected_modules,
             )
-            print("[DEBUG] analyze_project: after project_service.analyze()")
-            print("[DEBUG] analyze_project: before append_log('▸ Architecture analysis completed')")
             self.append_log("▸ Architecture analysis completed")
-            print("[DEBUG] analyze_project: after append_log('▸ Architecture analysis completed')")
-            print("[DEBUG] analyze_project: before update_pipeline('CTO', True)")
             self.update_pipeline("CTO", True)
-            print("[DEBUG] analyze_project: after update_pipeline('CTO', True)")
-            print("[DEBUG] analyze_project: before append_log(report)")
-            self.append_log(report)
-            print("[DEBUG] analyze_project: after append_log(report)")
+            self.append_log(report if report else "[EMPTY REPORT]")
         except Exception as error:
-            print("[DEBUG] analyze_project: exception caught, full traceback below")
-            traceback.print_exc()
-            error_message = str(error)
-            if isinstance(error, EnvironmentError):
-                error_message = (
-                    "AI provider configuration error: " + error_message
-                )
-            print("[DEBUG] analyze_project: before append_log(error)")
-            self.append_log(f"Error during analysis: {error_message}")
-            print("[DEBUG] analyze_project: after append_log(error)")
-            print("[DEBUG] analyze_project: before messagebox.showerror()")
-            messagebox.showerror("Analysis Error", error_message)
-            print("[DEBUG] analyze_project: after messagebox.showerror()")
+            tb = traceback.format_exc()
+            self.append_error(tb)
+            details = self._describe_exception(error)
+            self.append_error(f"Analyze failed: {details}")
+            self._show_message(
+                "error",
+                "Analysis Error",
+                details,
+            )
+            raise
 
     def on_generate_project(self):
         idea = self.get_idea_text()
         if not idea:
-            messagebox.showwarning("Empty Idea", "Please describe your startup idea.")
+            self._show_message("warning", "Empty Idea", "Please describe your startup idea.")
             return
 
-        self.progress_bar['value'] = 0
+        self._emit_ui_event("progress_set", 0)
         self.append_log("Starting project execution...")
 
-        def run():
+        self.run_background_task(lambda: self._run_generate_project_worker(idea))
+
+    def _run_generate_project_worker(self, idea: str) -> None:
+        try:
             result = self.executor_controller.run_project(idea)
             if result.success:
                 self.append_log("Project execution completed successfully.")
-                messagebox.showinfo("Success", "Project executed successfully.")
+                self._show_message("info", "Success", "Project executed successfully.")
             else:
                 self.append_error("Project execution completed with errors.")
-                messagebox.showerror("Execution Error", "Project execution completed with errors. Check logs for details.")
-
-        self.run_background_task(run)
+                self._show_message(
+                    "error",
+                    "Execution Error",
+                    "Project execution completed with errors. Check logs for details.",
+                )
+        except Exception as error:
+            tb = traceback.format_exc()
+            self.append_error(tb)
+            details = self._describe_exception(error)
+            self._show_message(
+                "error",
+                "Execution Error",
+                details,
+            )
+            raise
 
     def on_export(self):
         self.append_log("Exporting project artifacts...")
         self.update_pipeline("Deploy", True)
         self.append_log("▸ Export complete")
-        messagebox.showinfo("Export", "Project export completed successfully.")
+        self._show_message("info", "Export", "Project export completed successfully.")
 
     def on_settings(self):
         self.append_log("Opening settings...")
@@ -439,8 +489,38 @@ class LoopControlGUI:
         )
         warning_label.pack(anchor="w", padx=16, pady=(0, 16))
 
+        cache_checkbox = tk.Checkbutton(
+            settings_window,
+            text="Enable Cache",
+            variable=self.cache_enabled_var,
+            fg=TEXT_FG,
+            bg=DARK_BG,
+            activebackground=DARK_BG,
+            selectcolor=DARK_BG,
+            font=("Segoe UI", 10),
+            anchor="w",
+            padx=0,
+        )
+        cache_checkbox.pack(anchor="w", padx=16, pady=(0, 10))
+
         button_frame = tk.Frame(settings_window, bg=DARK_BG)
         button_frame.pack(fill="x", padx=16, pady=(0, 16))
+
+        clear_cache_button = tk.Button(
+            button_frame,
+            text="Clear Cache",
+            command=self.clear_cache,
+            bg=SURFACE,
+            fg=TEXT_FG,
+            activebackground=SURFACE_ALT,
+            activeforeground=TEXT_FG,
+            relief=tk.FLAT,
+            font=("Segoe UI", 10, "bold"),
+            padx=14,
+            pady=10,
+            cursor="hand2",
+        )
+        clear_cache_button.pack(side="left")
 
         save_button = tk.Button(
             button_frame,
@@ -463,11 +543,17 @@ class LoopControlGUI:
         try:
             provider = create_provider(provider_name)
             self.project_service.ai_provider = provider
+            self.project_service.set_cache_enabled(self.cache_enabled_var.get())
             self.append_log(f"AI provider set to {provider_name}.")
-            messagebox.showinfo("Settings Saved", f"AI provider set to {provider_name}.")
+            self._show_message("info", "Settings Saved", f"AI provider set to {provider_name}.")
             window.destroy()
         except Exception as error:
-            messagebox.showerror("Settings Error", str(error))
+            self._show_message("error", "Settings Error", f"{type(error).__name__}: {error}")
+
+    def clear_cache(self):
+        removed = self.project_service.clear_cache()
+        self.append_log(f"Cache cleared: {removed} file(s) removed.")
+        self._show_message("info", "Cache", f"Removed {removed} cached file(s).")
 
 
 def main():
